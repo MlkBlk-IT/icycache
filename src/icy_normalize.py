@@ -214,12 +214,10 @@ def normalize_payload(body: Dict[str, Any]) -> Dict[str, Any]:
                         norm_msgs.append(m)
                         continue
                     nm = {**m, "content": text_blocks(m.get("content"))}
-                    nm.pop("tool_call_id", None)  # correlation ID, pas du contenu
-                    if isinstance(nm.get("tool_calls"), list):
-                        nm["tool_calls"] = [
-                            {**tc, "id": ""} if isinstance(tc, dict) else tc
-                            for tc in nm["tool_calls"]
-                        ]
+                    # DELTA-004 : `tool_call_id` et les `id` de tool_calls RESTENT dans la cle.
+                    # Les effacer fusionnait des conversations differentes : une reponse en cache
+                    # pouvait etre rejouee chez un autre client avec un tool_call_id perime.
+                    # Correction > taux de hit.
                     norm_msgs.append(nm)
                 out[key] = norm_msgs
             elif key == "system":

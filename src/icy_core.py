@@ -93,7 +93,8 @@ hub = EventHub()
 
 
 # === DB ===
-EVENT_NEW_COLS = {"upstream": "TEXT", "client": "TEXT", "cached_tokens": "INTEGER", "cache_write_tokens": "INTEGER"}
+EVENT_NEW_COLS = {"upstream": "TEXT", "client": "TEXT", "cached_tokens": "INTEGER",
+                  "cache_write_tokens": "INTEGER", "hit_type": "TEXT", "note": "TEXT"}
 
 
 def init_db():
@@ -139,16 +140,18 @@ init_db()
 
 def log_event(kind, h, model_req, model_real, stream, pt=None, ct=None, sp=0, sc=0,
               latency_ms=None, ttft_ms=None, upstream=None, client=None,
-              cached_tokens=None, cache_write_tokens=None, req_id=None):
+              cached_tokens=None, cache_write_tokens=None, req_id=None,
+              hit_type=None, note=None):
     """Ligne dans events (tokens = valeurs upstream reelles ou NULL, jamais estimees) + push WS."""
     try:
         conn = _db()
         conn.execute(
             "INSERT INTO events (kind,hash,model_req,model_real,stream,prompt_tokens,completion_tokens,"
-            "saved_prompt,saved_completion,latency_ms,ttft_ms,upstream,client,cached_tokens,cache_write_tokens) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "saved_prompt,saved_completion,latency_ms,ttft_ms,upstream,client,cached_tokens,cache_write_tokens,"
+            "hit_type,note) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (kind, h, model_req, model_real, int(bool(stream)), pt, ct, sp, sc, latency_ms, ttft_ms,
-             upstream, client, cached_tokens, cache_write_tokens))
+             upstream, client, cached_tokens, cache_write_tokens, hit_type, note))
         conn.commit()
         conn.close()
     except Exception:
@@ -158,6 +161,7 @@ def log_event(kind, h, model_req, model_real, stream, pt=None, ct=None, sp=0, sc
                  "prompt_tokens": pt, "completion_tokens": ct, "cached_tokens": cached_tokens,
                  "cache_write_tokens": cache_write_tokens, "saved_prompt": sp, "saved_completion": sc,
                  "latency_ms": latency_ms, "ttft_ms": ttft_ms, "hash": (h or "")[:8],
+                 "hit_type": hit_type, "note": note,
                  "tokens_source": "upstream" if (pt is not None or ct is not None) else "n/a"})
 
 

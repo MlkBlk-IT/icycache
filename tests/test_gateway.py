@@ -394,3 +394,100 @@ def test_cache_clear_accepts_legacy_header(stack):
         r = c.post(stack["gw"] + "/api/cache-clear", headers={"X-CacheForge-Confirm": "FORCE_DELETE"})
         assert r.status_code == 200
         assert r.json()["success"] is True
+
+
+# =============================================================================
+# DELTA-005 : observabilite (hit_type / bypass reasons)
+# DELTA-003 : hit semantique servi + portee
+# =============================================================================
+def test_metrics_distinguish_exact_normalized_and_bypass(stack, clean_cache):
+    import httpx
+    exact = {"model": "mock-model", "messages": [{"role": "user", "content": "obs exact"}], "temperature": 0}
+    norm1 = {"model": "mock-model", "messages": [{"role": "user", "content": "obs norm"}], "temperature": 0}
+    norm2 = {"model": "mock-model", "messages": [{"role": "user", "content": "obs norm!"}], "temperature": 0}
+    byp = {"model": "mock-model", "messages": [{"role": "user", "content": "obs byp"}], "temperature": 0.8}
+    with httpx.Client(timeout=30) as c:
+        m0 = c.get(stack["gw"] + "/api/metrics").json()
+        c.post(stack["gw"] + "/v1/chat/completions", json=exact)   # MISS
+        c.post(stack["gw"] + "/v1/chat/completions", json=exact)   # HIT exact
+        c.post(stack["gw"] + "/v1/chat/completions", json=norm1)  # MISS
+        c.post(stack["gw"] + "/v1/chat/completions", json=norm2)  # HIT normalized
+        c.post(stack["gw"] + "/v1/chat/completions", json=byp)    # BYPASS
+        m1 = c.get(stack["gw"] + "/api/metrics").json()
+    d = lambda k: m1["hits_by_type"].get(k, 0) - m0["hits_by_type"].get(k, 0)  # noqa: E731
+    assert d("exact") == 1, m1["hits_by_type"]
+    assert d("normalized") == 1, m1["hits_by_type"]
+    assert d("semantic") == 0, m1["hits_by_type"]
+    assert m1["bypass"] - m0["bypass"] == 1
+    assert any("temperature" in k for k in m1["bypass_reasons"]), m1["bypass_reasons"]
+    # les metriques existantes ne sont pas redefinies
+    assert m1["hits"] >= m0["hits"] + 2 and m1["misses"] >= m0["misses"] + 2
+
+
+def test_semantic_hit_is_served_and_measured(stack, clean_cache):
+    import httpx
+    import server
+    from icy_cache_store import encode_entry
+
+    stored = encode_entry("openai", {"role": "assistant", "content": "SEMANTIC_ANSWER"},
+                           {"prompt_tokens": 11, "completion_tokens": 7},
+                           "mock-model", "stop", "", 5)
+
+    class _Fake:
+        available = True
+
+        def __init__(self, sig):
+            self.sig = sig
+
+        def lookup(self, q_norm, q_raw, sig):
+            if sig != self.sig:
+                return None
+            return ({"response": stored, "model": "mock-model",
+                     "created_at": "2026-11-02 10:00:00",
+                     "anchors_hard": [], "anchors_soft": []}, 0.99)
+
+        def index(self, *a, **k):
+            return None
+
+    body = {"model": "mock-model", "messages": [{"role": "user", "content": "paraphrase test"}],
+            "temperature": 0}
+    sig = server.semantic_scope(body, "mock", "/v1/chat/completions", "openai")
+    old = server.SEMANTIC
+    server.SEMANTIC = _Fake(sig)
+    try:
+        with httpx.Client(timeout=30) as c:
+            m0 = c.get(stack["gw"] + "/api/metrics").json()
+            before = stack["state"]["chat_calls"]
+            r = c.post(stack["gw"] + "/v1/chat/completions", json=body)
+            assert r.status_code == 200
+            j = r.json()
+            assert j["cached"] is True
+            assert j["choices"][0]["message"]["content"] == "SEMANTIC_ANSWER"
+            assert j["cache_hit_type"] == "semantic"
+            assert j["saved_prompt_tokens"] == 11 and j["saved_completion_tokens"] == 7
+            assert stack["state"]["chat_calls"] == before, "un hit semantique ne doit PAS appeler l'upstream"
+            # PORTEE : un autre modele => scope different => aucun hit semantique
+            r2 = c.post(stack["gw"] + "/v1/chat/completions",
+                        json={"model": "other-model", "messages": body["messages"], "temperature": 0})
+            assert r2.json().get("cache_hit_type") != "semantic"
+            m1 = c.get(stack["gw"] + "/api/metrics").json()
+    finally:
+        server.SEMANTIC = old
+    d = m1["hits_by_type"].get("semantic", 0) - m0["hits_by_type"].get("semantic", 0)
+    assert d == 1, m1["hits_by_type"]
+
+
+def test_stream_and_nonstream_share_the_same_cache_entry(stack, clean_cache):
+    """`stream` est hors cle : la forme de la reponse suit la REQUETE (serve_hit)."""
+    import httpx
+    payload = {"model": "mock-model", "messages": [{"role": "user", "content": "shape test"}],
+               "temperature": 0}
+    with httpx.Client(timeout=30) as c:
+        c.post(stack["gw"] + "/v1/chat/completions", json=payload)
+        before = stack["state"]["chat_calls"]
+        r = c.post(stack["gw"] + "/v1/chat/completions",
+                   json=dict(payload, stream=True))
+        assert r.status_code == 200
+        assert r.headers.get("x-icycache-hit") == "1"
+        assert "text/event-stream" in r.headers.get("content-type", "")
+        assert stack["state"]["chat_calls"] == before

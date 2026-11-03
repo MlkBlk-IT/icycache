@@ -56,13 +56,14 @@ def extract_soft(text: str) -> frozenset[str]:
 
 
 def accepts(query_norm: str, cand: dict, score: float,
-            HARD_MIN: float = 0.95, RELAX: float = 0.97) -> bool:
+            HARD_MIN: float = 0.95, RELAX: float = 0.97, query_soft=None) -> bool:
     if score < HARD_MIN:
         return False
     qh, ch = extract_hard(query_norm), frozenset(cand.get("anchors_hard", []))
     if qh != ch:
         return False
-    qs, cs = extract_soft(query_norm), frozenset(cand.get("anchors_soft", []))
+    qs = frozenset(query_soft) if query_soft is not None else extract_soft(query_norm)
+    cs = frozenset(cand.get("anchors_soft", []))
     if qs == cs:
         return True
     # RELAX seulement si ancres hard présentes (grounding numérique/path);
@@ -195,3 +196,149 @@ def index_async(store: SemanticStore, embedder: Embedder, sig: str,
         except Exception:
             pass  # index échoue → pas grave
     threading.Thread(target=_job, daemon=True).start()
+
+# =============================================================================
+# DELTA-003 : cache semantique comme SECOND NIVEAU (gateway HTTP)
+# -----------------------------------------------------------------------------
+# Regles :
+#  - le cache EXACT reste le 1er lookup ; le semantique n'est consulte qu'APRES
+#    un miss exact ;
+#  - un hit semantique ne franchit JAMAIS le scope (upstream, endpoint, modele,
+#    parametres de generation) ;
+#  - toute requete potentiellement non rejouable (tools, tool_choice,
+#    tool_calls / tool_call_id dans l'historique, contenu multimodal) est BYPASSEE ;
+#  - embedder/Qdrant indisponible = miss SILENCIEUX, jamais d'echec de requete.
+# =============================================================================
+import hashlib  # noqa: E402
+from datetime import datetime, timezone  # noqa: E402
+from typing import Any, Dict, Tuple  # noqa: E402
+
+# Champs de generation qui changent la reponse : ils font partie du scope.
+_SCOPE_FIELDS = ("model", "temperature", "top_p", "seed", "response_format",
+                 "max_tokens", "max_completion_tokens", "n", "stop", "logit_bias",
+                 "frequency_penalty", "presence_penalty", "reasoning_effort",
+                 "logprobs", "top_logprobs")
+
+
+def _canonical(obj: Any) -> str:
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
+
+
+def semantic_scope(body: Dict[str, Any], upstream: str, path: str, kind: str = "openai") -> str:
+    """Signature de perimetre. Un hit semantique ne franchit JAMAIS ce scope."""
+    scope = {"upstream": upstream, "path": path, "kind": kind}
+    for f in _SCOPE_FIELDS:
+        if isinstance(body, dict) and f in body:
+            scope[f] = body[f]
+    return hashlib.sha256(_canonical(scope).encode("utf-8")).hexdigest()[:32]
+
+
+def semantic_eligibility(body: Dict[str, Any]) -> Tuple[bool, str]:
+    """(eligible, raison). Refus EXPLICITE, jamais de bypass muet."""
+    if not isinstance(body, dict):
+        return False, "body invalide"
+    if body.get("tools") or body.get("tool_choice") is not None:
+        return False, "tools/tool_choice : reponse d'outil non rejouable"
+    for m in body.get("messages") or []:
+        if not isinstance(m, dict):
+            continue
+        if m.get("tool_calls"):
+            return False, "historique avec tool_calls : lie a un etat de conversation"
+        if m.get("tool_call_id"):
+            return False, "historique avec tool_call_id : correlation non rejouable"
+        content = m.get("content")
+        if isinstance(content, list):
+            for b in content:
+                if isinstance(b, dict) and b.get("type") not in (None, "text"):
+                    return False, "contenu multimodal : non rejouable"
+    if isinstance(body.get("input"), list):
+        return False, "input multi-items : non rejouable"
+    return True, "eligible"
+
+
+class SemanticLookup:
+    """2e niveau de cache. store/embedder injectables (tests sans reseau)."""
+
+    def __init__(self, cfg: Dict[str, Any], store=None, embedder=None):
+        self.cfg = dict(cfg or {})
+        self.threshold = float(self.cfg.get("semantic_threshold", 0.95))
+        self.relax = float(self.cfg.get("semantic_relax_threshold", 0.97))
+        self._store = store
+        self._embedder = embedder
+        self._embedder_failed = False
+
+    @property
+    def embedder(self):
+        """Auto-discovery LM Studio : LAZY (ne doit jamais casser l'import)."""
+        if self._embedder is None and not self._embedder_failed:
+            try:
+                self._embedder = Embedder(
+                    self.cfg.get("semantic_embed_url", "http://127.0.0.1:1234"),
+                    model=self.cfg.get("semantic_embed_model"))
+            except Exception as e:
+                self._embedder_failed = True
+                logger.warning("Embedder indisponible (%s) - cache semantique desactive", e)
+        return self._embedder
+
+    @property
+    def available(self) -> bool:
+        if self._store is None or not getattr(self._store, "available", True):
+            return False
+        return self.embedder is not None
+
+    def lookup(self, query_norm: str, query_raw: str, scope_sig: str):
+        """-> (payload, score) ou None. Jamais d'exception (miss silencieux)."""
+        if not self.available:
+            return None
+        try:
+            vec = self.embedder.embed(query_norm)
+            cand = self._store.search(scope_sig, vec, self.threshold)
+            if not cand:
+                return None
+            score = float(getattr(cand, "score", 0.0))
+            payload = getattr(cand, "payload", None) or {}
+            if not accepts(query_norm, payload, score, self.threshold, self.relax,
+                           query_soft=extract_soft(query_raw)):
+                return None
+            return payload, score
+        except Exception as e:
+            logger.warning("Semantic lookup failed (miss silencieux): %s", e)
+            return None
+
+    def index(self, query_norm: str, query_raw: str, scope_sig: str, response_json: str) -> None:
+        """Indexation en tache de fond : ne bloque jamais la reponse."""
+        if not self.available:
+            return
+
+        def _job():
+            try:
+                vec = self.embedder.embed(query_norm)
+                self._store.ensure(len(vec))
+                self._store.upsert(vec, {
+                    "sig": scope_sig,
+                    "response": response_json,
+                    "model": None,
+                    "anchors_hard": sorted(extract_hard(query_norm)),
+                    "anchors_soft": sorted(extract_soft(query_raw)),
+                    "ts": time.time(),
+                    "created_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                })
+            except Exception:
+                pass  # indexation echouee -> sans grave
+
+        threading.Thread(target=_job, daemon=True).start()
+
+
+def build_semantic_lookup(cfg: Dict[str, Any], store=None, embedder=None):
+    """Construit la couche semantique. None si desactive ou indisponible."""
+    if not (cfg or {}).get("semantic_enabled", False):
+        return None
+    try:
+        st = store or SemanticStore(cfg.get("qdrant_url", "http://127.0.0.1:6333"))
+        if not getattr(st, "available", True):
+            logger.info("Qdrant indisponible - cache semantique ignore")
+            return None
+        return SemanticLookup(cfg, store=st, embedder=embedder)
+    except Exception as e:
+        logger.warning("Cache semantique indisponible (%s) - desactive", e)
+        return None

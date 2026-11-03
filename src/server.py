@@ -65,6 +65,8 @@ from upstream_utils import StreamMeter, mutate, usage_from  # noqa: E402
 from icy_cache_store import CacheStore, decode_entry, encode_entry  # noqa: E402
 import icy_normalize  # noqa: E402
 from icy_normalize import cache_key, normalize_payload  # noqa: E402
+from icy_semantic import (build_semantic_lookup, semantic_eligibility,  # noqa: E402
+                           semantic_scope)
 import logging  # noqa: E402
 
 _log = logging.getLogger("IcyCache.gateway")
@@ -84,6 +86,59 @@ TIMEOUT = float(PROXY_CFG.get("timeout", 120))
 CACHE_CFG = CONFIG.get("cache", {})
 CACHE_UNSET_TEMPERATURE = bool(CACHE_CFG.get("cache_when_temperature_unset", True))
 WS_DELTA_INTERVAL = float(GW.get("ws_delta_interval_s", 0.25))
+
+
+# --- Cache semantique (2e niveau) : propriete + precedence EXPLICITES --------
+# PROPRIETAIRE : <dossier de la config gateway>/semantic_cache.json
+#                (en production : config/semantic_cache.json).
+# PRECEDENCE   : env SEMANTIC_ENABLED / SEMANTIC_THRESHOLD / SEMANTIC_RELAX_THRESHOLD
+#                > semantic_cache.json
+#                > cache.enable_semantic / cache.semantic_threshold de la config
+#                  gateway : fallback, utilise SEULEMENT si le fichier proprietaire
+#                  ne definit pas la cle (aucune valeur n'est ecrasee en silence).
+def _semantic_cfg_path() -> Optional[Path]:
+    env_path = os.environ.get("ICYCACHE_SEMANTIC_CONFIG")
+    if env_path:
+        return Path(env_path)
+    try:
+        return _CONFIG_FILE.parent / "semantic_cache.json"
+    except Exception:
+        return None
+
+
+def _resolve_semantic_cfg(gateway_cache: Dict[str, Any]) -> Dict[str, Any]:
+    cfg: Dict[str, Any] = {}
+    path = _semantic_cfg_path()
+    if path is not None and path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                cfg = {k: v for k, v in data.items() if not str(k).startswith("_")}
+        except Exception:
+            _log.warning("config semantique illisible: %s", path)
+    if "semantic_enabled" not in cfg:
+        cfg["semantic_enabled"] = bool(gateway_cache.get("enable_semantic", False))
+    if "semantic_threshold" not in cfg:
+        try:
+            cfg["semantic_threshold"] = float(gateway_cache.get("semantic_threshold", 0.95))
+        except (TypeError, ValueError):
+            cfg["semantic_threshold"] = 0.95
+    env_sem = (os.environ.get("SEMANTIC_ENABLED") or "").strip().lower()
+    if env_sem:
+        cfg["semantic_enabled"] = env_sem in ("1", "true", "yes", "on")
+    for env_key, cfg_key in (("SEMANTIC_THRESHOLD", "semantic_threshold"),
+                             ("SEMANTIC_RELAX_THRESHOLD", "semantic_relax_threshold")):
+        raw = os.environ.get(env_key)
+        if raw:
+            try:
+                cfg[cfg_key] = float(raw)
+            except ValueError:
+                pass
+    return cfg
+
+
+SEMANTIC_CFG = _resolve_semantic_cfg(CACHE_CFG)
+SEMANTIC = build_semantic_lookup(SEMANTIC_CFG)
 
 CACHE = CacheStore(
     DB_FILE,
@@ -210,6 +265,56 @@ def build_cache_key(body: Dict[str, Any], upstream: str, path: str) -> Tuple[str
         {k: v for k, v in (body or {}).items() if k not in icy_normalize.CACHE_KEY_IGNORED}
     ).encode("utf-8")).hexdigest()
     return key, raw
+
+
+def semantic_query(body: Dict[str, Any]) -> Tuple[str, str]:
+    """(texte normalise, texte brut) de TOUTE la requete (systeme + historique).
+
+    On embed la conversation complete, pas seulement le dernier message : un hit
+    semantique base sur le seul dernier tour rejouerait une reponse dans une
+    autre conversation.
+    """
+    parts = []
+    sys_val = body.get("system")
+    if isinstance(sys_val, str):
+        parts.append(sys_val)
+    elif isinstance(sys_val, list):
+        parts.extend(b.get("text", "") for b in sys_val
+                     if isinstance(b, dict) and isinstance(b.get("text"), str))
+    for key in ("messages", "prompt", "input"):
+        val = body.get(key)
+        if isinstance(val, str):
+            parts.append(val)
+        elif isinstance(val, list):
+            for m in val:
+                if not isinstance(m, dict):
+                    continue
+                c = m.get("content")
+                if isinstance(c, str):
+                    parts.append(c)
+                elif isinstance(c, list):
+                    parts.extend(b.get("text", "") for b in c
+                                 if isinstance(b, dict) and isinstance(b.get("text"), str))
+    raw = "\n".join(p for p in parts if p)
+    if not raw.strip():
+        return "", ""
+    return icy_normalize.get_default_normalizer().normalize(raw), raw
+
+
+def semantic_index(body: Dict[str, Any], upstream: str, path: str, kind: str, stored: str) -> None:
+    """Indexe la reponse pour le 2e niveau. Echec = ignore (jamais de panne)."""
+    if SEMANTIC is None:
+        return
+    try:
+        ok, _why = semantic_eligibility(body)
+        if not ok:
+            return
+        q_norm, q_raw = semantic_query(body)
+        if not q_norm:
+            return
+        SEMANTIC.index(q_norm, q_raw, semantic_scope(body, upstream, path, kind), stored)
+    except Exception:
+        _log.debug("indexation semantique ignoree", exc_info=True)
 
 
 def display_prompt(body: Dict[str, Any]) -> str:
@@ -470,11 +575,41 @@ async def run_llm(request: Request, body: Dict[str, Any], path: str, upstream: s
     is_chat = path.startswith("/v1/chat/completions") or path.startswith("/v1/messages")
     is_embed = path.startswith("/v1/embeddings")
 
-    # --- HIT ---
+    # --- HIT exact (1er niveau) ---
+    hit_type = "miss" if cacheable else "bypass"
+    note = None if cacheable else ("bypass: " + cache_reason)
     if cacheable and (is_chat or is_embed):
         hit = CACHE.get(ckey)
         if hit:
-            return serve_hit(hit, body, path, upstream, kind, ckey, raw_hash, t0, lab, req_id)
+            # "exact" = payload brut identique ; "normalized" = meme cle apres normalisation
+            ht = "exact" if (hit.get("raw_hash") and hit.get("raw_hash") == raw_hash) else "normalized"
+            return serve_hit(hit, body, path, upstream, kind, ckey, raw_hash, t0, lab, req_id,
+                             hit_type=ht)
+
+    # --- HIT semantique (2e niveau) : UNIQUEMENT apres un miss exact ---
+    if cacheable and is_chat and not is_embed:
+        ok, why = semantic_eligibility(out_body)
+        if not ok:
+            note = "semantic_bypass: " + why
+        elif SEMANTIC is None:
+            note = "semantic_unavailable: desactive"
+        elif not SEMANTIC.available:
+            note = "semantic_unavailable: embedder/qdrant indisponible"
+        else:
+            q_norm, q_raw = semantic_query(out_body)
+            sig = semantic_scope(out_body, upstream, path, kind)
+            found = SEMANTIC.lookup(q_norm, q_raw, sig) if q_norm else None
+            if found:
+                payload, score = found
+                stored = payload.get("response")
+                if stored:
+                    _log.info("SEMANTIC HIT score=%.3f scope=%s", score, sig)
+                    sem_hit = {"response": stored, "model": payload.get("model"),
+                               "created_at": payload.get("created_at"),
+                               "access_count": 1, "raw_hash": None}
+                    return serve_hit(sem_hit, body, path, upstream, kind, ckey, raw_hash, t0, lab,
+                                     req_id, hit_type="semantic")
+            note = "semantic_miss"
 
     # --- MISS ---
     url = target_url(upstream, path)
@@ -484,13 +619,16 @@ async def run_llm(request: Request, body: Dict[str, Any], path: str, upstream: s
 
     if is_stream:
         return await forward_stream(req_id, url, headers, out_body, upstream, kind, ckey, raw_hash,
-                                    cacheable, cache_reason, t0, lab, path, is_chat, is_embed, injected)
+                                    cacheable, cache_reason, t0, lab, path, is_chat, is_embed, injected,
+                                    hit_type=hit_type, note=note)
     return await forward_json(req_id, url, headers, out_body, upstream, kind, ckey, raw_hash,
-                              cacheable, cache_reason, t0, lab, path, is_chat, is_embed, injected)
+                              cacheable, cache_reason, t0, lab, path, is_chat, is_embed, injected,
+                              hit_type=hit_type, note=note)
 
 
 def serve_hit(hit: Dict[str, Any], body: Dict[str, Any], path: str, upstream: str, kind: str,
-              ckey: str, raw_hash: str, t0: float, lab: str, req_id: str) -> Response:
+              ckey: str, raw_hash: str, t0: float, lab: str, req_id: str,
+              hit_type: str = "exact") -> Response:
     """Reponse depuis le cache : tokens sauvegardes = usage reel du premier appel."""
     entry = decode_entry(hit["response"])
     usage = entry.get("usage") or {}
@@ -505,12 +643,12 @@ def serve_hit(hit: Dict[str, Any], body: Dict[str, Any], path: str, upstream: st
         sc = usage.get("completion_tokens")
         log_event("HIT", ckey, body.get("model"), model, bool(body.get("stream")),
                   sp=sp, sc=sc, latency_ms=latency_ms, upstream=upstream, client=lab,
-                  cached_tokens=usage.get("cached_tokens"), req_id=req_id)
+                  cached_tokens=usage.get("cached_tokens"), req_id=req_id, hit_type=hit_type)
         if body.get("stream"):
             return _replay_anthropic_stream(entry, model, finish, usage)
         return JSONResponse(build_anthropic_response(
             entry.get("message"), model, finish, anthropic_usage_from_norm(usage),
-            extra={"cached": True, "cache_hash": ckey[:8],
+            extra={"cached": True, "cache_hash": ckey[:8], "cache_hit_type": hit_type,
                    "saved_prompt_tokens": sp, "saved_completion_tokens": sc,
                    "cache_age_seconds": _cache_age(hit.get("created_at")),
                    "hit_count": hit.get("access_count", 1),
@@ -520,7 +658,7 @@ def serve_hit(hit: Dict[str, Any], body: Dict[str, Any], path: str, upstream: st
     sc = ct or 0
     log_event("HIT", ckey, body.get("model"), model, bool(body.get("stream")),
               sp=sp, sc=sc, latency_ms=latency_ms, upstream=upstream, client=lab,
-              cached_tokens=usage.get("cached_tokens"), req_id=req_id)
+              cached_tokens=usage.get("cached_tokens"), req_id=req_id, hit_type=hit_type)
 
     if body.get("stream"):
         sse = entry.get("sse")
@@ -532,7 +670,7 @@ def serve_hit(hit: Dict[str, Any], body: Dict[str, Any], path: str, upstream: st
     return JSONResponse(build_openai_response(
         entry.get("message"), model, finish,
         {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
-        extra={"cached": True, "cache_hash": ckey[:8],
+        extra={"cached": True, "cache_hash": ckey[:8], "cache_hit_type": hit_type,
                "saved_prompt_tokens": sp, "saved_completion_tokens": sc,
                "saved_total_tokens": sp + sc,
                "original_gen_time_ms": entry.get("gen_time_ms"),
@@ -586,7 +724,8 @@ def _replay_anthropic_stream(entry: Dict[str, Any], model: Optional[str], finish
 async def forward_json(req_id: str, url: str, headers: Dict[str, str], body: Dict[str, Any],
                        upstream: str, kind: str, ckey: str, raw_hash: str, cacheable: bool,
                        cache_reason: str, t0: float, lab: str, path: str, is_chat: bool,
-                       is_embed: bool, injected: Optional[str]):
+                       is_embed: bool, injected: Optional[str],
+                       hit_type: str = "miss", note: Optional[str] = None):
     t_fwd = time.perf_counter()
     try:
         async with httpx.AsyncClient(timeout=TIMEOUT) as client:
@@ -628,7 +767,8 @@ async def forward_json(req_id: str, url: str, headers: Dict[str, str], body: Dic
     log_event("MISS" if cacheable else "BYPASS", ckey, body.get("model"), model, False, pt, ct,
               latency_ms=latency_ms, upstream=upstream, client=lab,
               cached_tokens=norm.get("cached_tokens"),
-              cache_write_tokens=norm.get("cache_write_tokens"), req_id=req_id)
+              cache_write_tokens=norm.get("cache_write_tokens"), req_id=req_id,
+              hit_type=hit_type, note=note)
 
     if cacheable and (is_chat or is_embed):
         stored = encode_entry(kind, message, norm, model, finish, "", gen_time)
@@ -637,6 +777,8 @@ async def forward_json(req_id: str, url: str, headers: Dict[str, str], body: Dic
                       display_prompt(body), stored, False, upstream, model, raw_hash)
         except Exception:
             _log.exception("CACHE.set (json) a echoue")
+        if is_chat and not is_embed:
+            semantic_index(body, upstream, path, kind, stored)
 
     if kind == "anthropic":
         payload = build_anthropic_response(message, model, finish, anthropic_usage(raw_usage))
@@ -650,7 +792,8 @@ async def forward_json(req_id: str, url: str, headers: Dict[str, str], body: Dic
 async def forward_stream(req_id: str, url: str, headers: Dict[str, str], body: Dict[str, Any],
                          upstream: str, kind: str, ckey: str, raw_hash: str, cacheable: bool,
                          cache_reason: str, t0: float, lab: str, path: str, is_chat: bool,
-                         is_embed: bool, injected: Optional[str]):
+                         is_embed: bool, injected: Optional[str],
+                         hit_type: str = "miss", note: Optional[str] = None):
     t_fwd = time.perf_counter()
     client = httpx.AsyncClient(timeout=TIMEOUT)
     try:
@@ -728,7 +871,8 @@ async def forward_stream(req_id: str, url: str, headers: Dict[str, str], body: D
         log_event("MISS" if cacheable else "BYPASS", ckey, body.get("model"), model, True, pt, ct,
                   latency_ms=latency_ms, ttft_ms=state["ttft_ms"], upstream=upstream, client=lab,
                   cached_tokens=norm.get("cached_tokens"),
-                  cache_write_tokens=norm.get("cache_write_tokens"), req_id=req_id)
+                  cache_write_tokens=norm.get("cache_write_tokens"), req_id=req_id,
+                  hit_type=hit_type, note=note)
 
         _sse_all = "".join(state["sse"])
         _complete = state["ok"] and (("[DONE]" in _sse_all) if kind == "openai"
@@ -747,6 +891,8 @@ async def forward_stream(req_id: str, url: str, headers: Dict[str, str], body: D
                           display_prompt(body), stored, True, upstream, model, raw_hash)
             except Exception:
                 _log.exception("CACHE.set (stream) a echoue")
+            if is_chat and not is_embed:
+                semantic_index(body, upstream, path, kind, stored)
 
     return StreamingResponse(gen(), media_type="text/event-stream",
                              headers={"X-IcyCache-Upstream": upstream,
@@ -904,6 +1050,12 @@ async def api_metrics():
         rows = conn.execute("""SELECT datetime(ts,'localtime'), kind, model_real, prompt_tokens,
             completion_tokens, latency_ms, ttft_ms, saved_prompt+saved_completion
             FROM events ORDER BY id DESC LIMIT 50""").fetchall()
+        by_type = dict(conn.execute(
+            "SELECT COALESCE(hit_type,'unknown'), COUNT(*) FROM events WHERE kind='HIT' GROUP BY 1"
+        ).fetchall())
+        by_note = dict(conn.execute(
+            "SELECT COALESCE(note,'-'), COUNT(*) FROM events WHERE kind='BYPASS' "
+            "GROUP BY 1 ORDER BY 2 DESC LIMIT 20").fetchall())
     finally:
         conn.close()
     n, hits, miss, byp, tin, tout, sin, sout, tk_c, tk_ms, no_usage, d_c, d_ms, \
@@ -934,7 +1086,8 @@ async def api_metrics():
             "oneshot_bypass": os_byp, "oneshot_hit_rate_pct": os_hr,
             "oneshot_hit_latency_ms": os_hit_lat, "oneshot_miss_latency_ms": os_miss_lat,
             "agentic_requests": ag_n, "agentic_hits": ag_hits, "agentic_hit_rate_pct": ag_hr,
-            "speedup_factor": speedup, "recent": recent}
+            "speedup_factor": speedup, "hits_by_type": by_type, "bypass_reasons": by_note,
+            "recent": recent}
 
 
 @app.get("/api/metrics/series")

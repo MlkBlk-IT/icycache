@@ -1,8 +1,12 @@
 {
-  "semantic_enabled": true,
+  "_owner": "Ce fichier est la source de VERITE des reglages semantiques. Precedence explicite : variable d'environnement SEMANTIC_ENABLED/SEMANTIC_THRESHOLD/SEMANTIC_RELAX_THRESHOLD > ce fichier > cache.enable_semantic de config/icycache.gateway.json (fallback).",
+  "_opt_in": "Le cache semantique est OPT-IN : semantic_enabled=false par defaut. Activation explicite : SEMANTIC_ENABLED=true (env) ou semantic_enabled=true (ce fichier).",
+  "semantic_enabled": false,
   "semantic_threshold": 0.95,
   "semantic_relax_threshold": 0.97,
   "semantic_embed_url": "http://127.0.0.1:1234",
   "semantic_embed_model": null,
-  "qdrant_url": "http://127.0.0.1:6333"
+  "qdrant_url": "http://127.0.0.1:6333",
+  "semantic_promote_to_exact": false,
+  "_promote_note": "false = un hit semantique n'est PAS recopie dans le cache exact (le cache exact reste exact)."
 }
