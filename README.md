@@ -1,4 +1,43 @@
 > ## ⚠️ NOTICE — The rest of this repository (code, comments, scripts, docs, commits, issues) is written in **French**. Only this README is in English.
+>
+> ### v0.4.0 — multilingual semantic anchors + a test suite that runs (2026-11-03)
+>
+> **Improvements**
+> - **`pytest tests/` runs again.** It used to exit with code 1 and *zero* output: three test files were
+>   scripts, not pytest modules — `test_cacheforge*.py` call `sys.exit()` at import when `CF_BASE` is
+>   missing, and `test_prefix_proxy.py` ends with `os._exit()`, which killed the whole pytest process.
+>   `granite_live_test.py` matched `*_test.py` and was collected, starting a live LM Studio benchmark
+>   during collection.
+> - **The two async tests can pass now** — `pytest-asyncio` was missing from the `dev` extra and from
+>   the virtualenv (`async def functions are not natively supported`).
+> - **"plus de" is no longer corrupted.** `normalize_numbers()` replaced `" plus "` with `"+"`
+>   everywhere: *"Donne-moi plus de détails"* became *"Donne-moi+de détails"*, changing the cache key
+>   **and** the embedding input. Operators are now converted only between two numeric operands, in a
+>   single implementation shared by `icy_normalize.py` and `icy_semantic.py`.
+> - **Path anchors no longer swallow every slash** (`"A/B"` → `"/b"`, `"12/24"` → `"/24"`), so two
+>   paraphrases can finally share their hard anchors.
+> - **The entity guard is back on the MCP path.** It compared the *normalised* (lower-case) prompt and
+>   therefore saw zero soft anchors — *"Montreal"* and *"Quebec City"* were no longer distinguished.
+> - The `RELAX` acceptance path now requires **shared grounding** (identical hard anchors, or one
+>   common strong entity), so those two are no longer accepted at 0.99 similarity.
+>
+> **What's new**
+> - **A multilingual anchor engine** — `src/icy_lang.py` + `config/lang_profiles.json`, **24 languages**.
+>   Casing only marks an entity in *some* languages, so the engine tokenises **per script**
+>   (latin / CJK / cyrillic / arabic / devanagari / bengali), detects the language, and applies three
+>   casing models: `sentence` (en, fr, es, pt, it, vi, tr — a capitalised word outside a sentence
+>   start is an entity), `noun` (de, nl, pl, sv, da, cs, hu, fi, no, ru, uk — **all** nouns are
+>   capitalised, so they are filtered), `none` (zh, ja, ko, ar, hi, bn — no casing, only Latin
+>   acronyms and CamelCase count).
+>   **No language is hardcoded in the source any more — adding one is a single JSON key.**
+> - **Per-language soft anchors on the MCP path**, taken from the raw text.
+> - `tests/conftest.py` isolates the test scripts from pytest collection; `pyproject.toml` gains
+>   `[tool.pytest.ini_options]`; `pytest-asyncio` joins the `dev` extra.
+> - **84 tests pass** — the suite was previously unrunnable.
+>
+> ⚠️ **Breaking:** the cache key format changed. The entries already in `db/cache.db` were written with
+> the old normalisation and will never be read again (TTL 30 days, or `DELETE FROM cache; VACUUM;`).
+>
 > ✅ **SWAP DONE — 2026-10-24.** IcyCache was renamed from CacheForge. The **universal multi-upstream gateway**
 > is now the **single active service on `:8080`**, and the historical server holds the MCP layer.
 > - `src/server.py` → **the gateway** (18 upstreams in `config/icycache.gateway.json`: OmniRoute, LM Studio, Ollama, OpenAI, Anthropic, NVIDIA, Groq, Cerebras, OpenRouter, Kilo, Nous, Copilot, AI Gateway, HuggingFace, Google AI Studio, LLM7.io, Mistral, Cloudflare).
@@ -42,6 +81,20 @@
 > 📖 **Full configuration guide** : [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md)
 > — multi-upstream routing, per-client setup (Hermes, Claude Desktop, Cursor, VS Code,
 > Ollama, direct SDK), MISS→HIT proof, troubleshooting, firewall enforcement.
+
+---
+
+## What's new in v0.4.0
+
+| Area | Change |
+|------|--------|
+| **Semantic cache** | Multilingual anchor engine — **24 languages** (`src/icy_lang.py` + `config/lang_profiles.json`). No language is hardcoded in the source any more: adding one is a single JSON key. |
+| **Tests** | `pytest tests/` runs again — **84 tests pass** (the suite was previously unrunnable). `pytest-asyncio` added to the `dev` extra. |
+| **Normalization** | `"plus de"` is no longer turned into `"+"` (it corrupted French prompts, the cache key and the embedding). One shared implementation for `icy_normalize.py` and `icy_semantic.py`. |
+| **Anchors** | Paths no longer swallow every slash (`"A/B"` → `"/b"`). The named-entity guard is active again on the MCP path, and the `RELAX` path requires shared grounding. |
+
+Full details in the notice at the top of this page and in the
+[v0.4.0 release notes](https://github.com/MlkBlk-IT/icycache/releases/tag/v0.4.0).
 
 ---
 
