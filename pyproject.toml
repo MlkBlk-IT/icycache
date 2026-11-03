@@ -1,6 +1,6 @@
 [project]
 name = "icycache"
-version = "0.3.2"
+version = "0.4.0"
 description = "IcyCache - universal LLM gateway with a local cache. I see cache, I burn cache."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -60,6 +60,9 @@ tray = [
 ]
 dev = [
     "pytest>=8.0",
+    # Requis par les tests async (tests/test_upstream_recovery.py).
+    # Sans lui : "async def functions are not natively supported" -> 2 echecs.
+    "pytest-asyncio>=0.24",
     "ruff>=0.5.0",
 ]
 
@@ -130,3 +133,12 @@ target-version = "py310"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# `*_test.py` n'est PAS collecte : tests/granite_live_test.py est un benchmark
+# live (LM Studio :8080) qui lancerait du trafic reel a la collecte.
+python_files = ["test_*.py"]
+# Les 4 scripts de tests/ sont ignores via tests/conftest.py (collect_ignore_glob).
+asyncio_mode = "auto"
+addopts = "-q"

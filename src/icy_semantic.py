@@ -6,12 +6,20 @@ tout échec = miss silencieux → upstream. Jamais de panne.
 Embedding model: auto-discovery via /v1/models (pas de hardcodage).
 """
 from __future__ import annotations
-import re
+
 import json
+import logging
+import re
+import threading
 import time
 import uuid
-import threading
-import logging
+
+# Source UNIQUE de la normalisation des nombres (mots-nombres -> chiffres,
+# operateurs verbaux -> symboles). Importee aussi par icy_normalize, qui calcule
+# la cle de cache EXACT : les deux copies divergeaient et les deux cassaient
+# le francais ("plus de details" -> "plus+de details").
+from icy_normalize import normalize_numbers  # noqa: F401
+from icy_lang import extract_soft  # noqa: F401
 
 logger = logging.getLogger("icycache.semantic")
 
@@ -20,23 +28,15 @@ logger = logging.getLogger("icycache.semantic")
 _HARD = [
     ("num", r"\b\d+(?:[.,]\d+)?\b"),
     ("quote", r"[\"'`]([^\"'`]{1,60})[\"'`]"),
-    ("path", r"\b[A-Za-z]:\\[^\s]+|(?:\./|/)[^\s]+"),
+    # Un chemin = racine windows ("C:\dir\f"), relatif ("./dir") ou absolu POSIX
+    # avec AU MOINS 2 segments. L'ancien motif "(?:\./|/)[^\s]+" matchait TOUT
+    # slash : "A/B" -> "/b", "12/24" -> "/24", "cache DNS/web" -> "/web".
+    # Consequence : deux paraphrases francaises avaient des ancres hard
+    # differentes => le cache semantique ne pouvait jamais repondre.
+    ("path", r"\b[A-Za-z]:\\[^\s]+|(?:\./[^\s]+)|(?:/(?:[\w.\-]+/)+[\w.\-]+)"),
     ("unit", r"\b\d+\s?(?:kg|km|cm|mm|mb|gb|tb|ms|min|h|%|°c|°f|usd|eur)\b"),
     ("url", r"https?://[^\s]+"),
 ]
-
-_NUM_WORDS = {"zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
-              "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
-              "ten": "10"}
-
-
-def normalize_numbers(t: str) -> str:
-    """Convertit mots-nombres → chiffres et opérateurs verbaux → symboles.
-    À appeler AVANT hash ET avant embedding."""
-    for w, d in _NUM_WORDS.items():
-        t = re.sub(rf"\b{w}\b", d, t)
-    return (t.replace(" plus ", "+").replace(" minus ", "-")
-             .replace(" times ", "*").replace(" divided by ", "/"))
 
 
 def extract_hard(text: str) -> frozenset[str]:
@@ -47,12 +47,9 @@ def extract_hard(text: str) -> frozenset[str]:
     return frozenset(out)
 
 
-def extract_soft(text: str) -> frozenset[str]:
-    return frozenset(
-        m.group(0).lower()
-        for m in re.finditer(r"\b[A-Z][a-zà-ÿ]{2,}\b", text)
-        if m.start() > 0
-    )
+# Ancres SOFT = entites fortes, resolues par le moteur MULTILINGUE
+# (src/icy_lang.py) : la casse n'est un marqueur d'entite que dans certaines
+# langues. Aucune langue n'est codee en dur ici (cf. extract_soft ci-dessus).
 
 
 def accepts(query_norm: str, cand: dict, score: float,
@@ -66,9 +63,13 @@ def accepts(query_norm: str, cand: dict, score: float,
     cs = frozenset(cand.get("anchors_soft", []))
     if qs == cs:
         return True
-    # RELAX seulement si ancres hard présentes (grounding numérique/path);
-    # sans hard anchors, soft anchors doivent matcher exactement.
-    if qh and score >= RELAX:
+    # RELAX : grounding PARTAGE obligatoire. Les ancres hard (nombres, chemins,
+    # URLs, quotes) doivent etre identiques, OU les deux textes doivent partager
+    # au moins une entite forte. Sans ce garde-fou, "Montreal" et "Quebec City"
+    # seraient acceptes a 0.99 de similarite. (Le texte normalise etant en
+    # minuscules, il ne porte AUCUNE ancre soft : sans ce partage, la voie RELAX
+    # ne declencherait plus jamais, ni sur la gateway ni sur le MCP.)
+    if score >= RELAX and (qh or (qs & cs)):
         return True
     return False
 
@@ -181,7 +182,15 @@ class SemanticStore:
 # ---- Indexation async (ne bloque jamais) ------------------------------------
 
 def index_async(store: SemanticStore, embedder: Embedder, sig: str,
-                 query_norm: str, resp_json: str):
+                 query_norm: str, resp_json: str, query_raw: str | None = None):
+    """Indexation en arriere-plan (DELTA-002, cote MCP).
+
+    `query_raw` (texte BRUT) alimente les ancres soft, comme pour la voie
+    DELTA-003 : le texte normalise est en minuscules et ne porte donc aucune
+    ancre soft. Sans cette coherence, un hit semantique du MCP ne pouvait pas
+    etre compare a une entite forte (le garde-fou "Montreal != Quebec City"
+    etait inerte sur cette voie).
+    """
     def _job():
         try:
             v = embedder.embed(query_norm)
@@ -190,7 +199,7 @@ def index_async(store: SemanticStore, embedder: Embedder, sig: str,
                 "sig": sig,
                 "response": resp_json,
                 "anchors_hard": sorted(extract_hard(query_norm)),
-                "anchors_soft": sorted(extract_soft(query_norm)),
+                "anchors_soft": sorted(extract_soft(query_raw if query_raw is not None else query_norm)),
                 "ts": time.time(),
             })
         except Exception:

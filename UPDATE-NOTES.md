@@ -5,6 +5,73 @@
 
 ---
 
+## v0.4.0 — 2026-11-03
+
+**The test suite runs again, and the semantic cache finally works in every major language.**
+
+### Added
+
+- **A multilingual anchor engine (`src/icy_lang.py`) driven by 24 language profiles
+  (`config/lang_profiles.json`).** The semantic cache needs "soft anchors" (named entities) to tell
+  *"a DNS cache"* from *"a web cache"*. Casing only marks an entity in some languages, so the
+  engine now:
+  - tokenises **per script** (Latin / CJK / Cyrillic / Arabic / Devanagari / Bengali) — without
+    this, `DNSキャッシュ` was a single token and the acronym was invisible;
+  - detects the language (script first, then distinct stop-word hits — at least two hits **and** a
+    lead over the second candidate, otherwise "unknown");
+  - applies three casing models: `sentence` (en, fr, es, pt, it, vi, tr — a capitalised word that
+    is not sentence-initial is an entity), `noun` (de, nl, pl, sv, da, cs, hu, fi, no, ru, uk —
+    **all** nouns are capitalised, so they are filtered against a common-word list), `none`
+    (zh, ja, ko, ar, hi, bn — no casing, only Latin acronyms and CamelCase count).
+
+  **No language is hardcoded in the source any more** — adding one is a single JSON key.
+- **Per-language soft anchors on the MCP path.** `mcp_server.py` compared the *normalised* prompt,
+  which is lower-case and therefore carried **zero** soft anchors: the *"Montreal ≠ Quebec City"*
+  guard was completely inert there. The raw text is now used on both the lookup and the indexing
+  side.
+- **`tests/conftest.py`** isolates the four test *scripts* from pytest collection, and
+  `pyproject.toml` gains a `[tool.pytest.ini_options]` section (`testpaths`, `python_files`,
+  `asyncio_mode`).
+
+### Fixed
+
+- **`pytest tests/` no longer dies silently.** It exited with code 1 and **zero** output: three test
+  files are scripts, not pytest modules — `test_cacheforge.py` and `test_cacheforge_ext.py` call
+  `sys.exit()` at import when `CF_BASE` is missing, and `test_prefix_proxy.py` ends with
+  `os._exit()`, which killed the whole pytest process. `granite_live_test.py` matched `*_test.py`
+  and was collected, starting a live LM Studio benchmark during collection.
+- **The two async tests could never pass.** `pytest-asyncio` was missing from the `dev` extra and
+  from the virtualenv, so `tests/test_upstream_recovery.py` failed with *"async def functions are
+  not natively supported"*.
+- **The French word "plus" was corrupting every prompt.** `normalize_numbers()` replaced
+  `" plus "` with `"+"` everywhere: *"Donne-moi plus de détails"* became *"Donne-moi+de détails"*.
+  It changed the exact-cache key **and** the embedding input. Operators are now converted only
+  between two numeric operands, in a single shared implementation used by `icy_normalize.py` and
+  `icy_semantic.py` (the two copies had drifted apart).
+- **The path anchor swallowed every slash.** `(?:\./|/)[^\s]+` matched `"A/B"` → `"/b"` and
+  `"12/24"` → `"/24"`, so two paraphrases could never share their hard anchors and the semantic
+  cache could never answer. A path now requires a drive root, a relative path, or at least two
+  POSIX segments.
+- **Named entities were detected by capitalisation alone**, which in French marks a sentence
+  start, not an entity. `extract_soft()` now uses acronyms, internal CamelCase and
+  capitalisation-outside-sentence-start, filtered per language.
+
+### Changed
+
+- The `RELAX` acceptance path now requires **shared grounding** (identical hard anchors, or at
+  least one common strong entity). Without it, *"Montreal"* and *"Quebec City"* were accepted at
+  0.99 similarity.
+- Version bumped to 0.4.0 — `pyproject.toml`, `package.json`, the README badge and
+  `docs/INSTALL.md` now match this release.
+
+### ⚠ Breaking
+
+- **The cache key format changed.** The entries already in `db/cache.db` were written with the
+  old normalisation and will never be read again. They expire by TTL (30 days) or can be dropped
+  with `DELETE FROM cache; VACUUM;`.
+
+---
+
 ## v0.3.2 — 2026-10-26
 
 **Prepared for publication — the first registry publish is still pending.**

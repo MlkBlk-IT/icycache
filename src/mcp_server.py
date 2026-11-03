@@ -94,13 +94,14 @@ import icy_normalize
 # DELTA-002: résilience upstream + cache sémantique + tools registry
 from upstream_client import ResilientUpstream, UpstreamError
 try:
-    from icy_semantic import normalize_numbers as _norm_nums, SemanticStore, Embedder, accepts as _sem_accepts, index_async as _sem_index
+    from icy_semantic import normalize_numbers as _norm_nums, SemanticStore, Embedder, accepts as _sem_accepts, index_async as _sem_index, extract_soft as _sem_extract_soft
 except ImportError:
     _norm_nums = lambda t: t
     SemanticStore = None
     Embedder = None
     _sem_accepts = None
     _sem_index = None
+    _sem_extract_soft = None
 
 # Load semantic cache config (opt-in, default off)
 _SEM_CFG_FILE = PROJECT_ROOT / "config" / "semantic_cache.json"
@@ -740,7 +741,7 @@ async def proxy_chat(request: Request):
         try:
             _sem_vec = _sem_embedder.embed(normalized)
             _sem_cand = _sem_store.search(_tools_sig, _sem_vec, SEMANTIC_THRESHOLD)
-            if _sem_cand and _sem_accepts(normalized, _sem_cand.payload, _sem_cand.score, SEMANTIC_THRESHOLD, SEMANTIC_RELAX):
+            if _sem_cand and _sem_accepts(normalized, _sem_cand.payload, _sem_cand.score, SEMANTIC_THRESHOLD, SEMANTIC_RELAX, query_soft=_sem_extract_soft(user_prompt_text)):
                 logger.info(f"SEMANTIC HIT: score={_sem_cand.score:.3f} sig={_tools_sig}")
                 _sem_resp = _sem_cand.payload["response"]
                 # Servir la réponse sémantique (même format que hit exact)
@@ -933,7 +934,7 @@ async def proxy_chat(request: Request):
                                 )
             # DELTA-002: indexation sémantique async (ne bloque jamais)
             if SEMANTIC_ENABLED and _sem_store and _sem_embedder and _sem_store.available:
-                _sem_index(_sem_store, _sem_embedder, _tools_sig, normalized, response_to_cache)
+                _sem_index(_sem_store, _sem_embedder, _tools_sig, normalized, response_to_cache, user_prompt_text)
         else:
             logger.info("CACHE SKIP: Not saving non-deterministic non-stream response")
         

@@ -47,6 +47,38 @@ _VOLATILE_SYSTEM_DATES = re.compile(
 )
 
 
+# --- Normalisation des nombres (source UNIQUE du projet) ----------------------
+# "two plus two" -> "2+2".
+# Les operateurs verbaux ne sont convertis qu'entre DEUX operands numeriques.
+# Le remplacement global (" plus " -> "+") cassait le francais :
+# "Donne-moi plus de details" -> "Donne-moi+de details" (cle de cache fausse
+# + embedding pollue). Idem "il y a plus de 3 fichiers" -> "il y a+de 3".
+_NUM_WORDS = {"zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
+              "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
+              "ten": "10"}
+_ARITH_OPS = (("plus", "+"), ("minus", "-"), ("times", "*"), ("divided by", "/"))
+# (?<=[\d\)]) = operande gauche ; (?=[\d\(]) = operande droit.
+_ARITH_RE = {
+    op: re.compile(r"(?<=[\d\)])\s+" + re.escape(op) + r"\s+(?=[\d\(])")
+    for op, _ in _ARITH_OPS
+}
+
+
+def normalize_numbers(t: str) -> str:
+    """Mots-nombres -> chiffres, operateurs verbaux -> symboles.
+
+    "What is two plus two?"  -> "What is 2+2?"
+    "Donne-moi plus de details" -> INCHANGE ("plus" n'est pas un operateur).
+    """
+    if not t:
+        return t
+    for w, d in _NUM_WORDS.items():
+        t = re.sub(rf"\b{w}\b", d, t)
+    for op, sym in _ARITH_OPS:
+        t = _ARITH_RE[op].sub(sym, t)
+    return t
+
+
 def canonical(obj: Any) -> str:
     """JSON canonique (cles triees, separateurs compacts) -> hachage stable."""
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
@@ -130,13 +162,7 @@ class Normalizer:
 
     def _normalize_numbers(self, text: str) -> str:
         """DELTA-002: convertit mots-nombres → chiffres et opérateurs verbaux → symboles."""
-        _NUM_WORDS = {"zero": "0", "one": "1", "two": "2", "three": "3", "four": "4",
-                      "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9",
-                      "ten": "10"}
-        for w, d in _NUM_WORDS.items():
-            text = re.sub(rf"\b{w}\b", d, text)
-        return (text.replace(" plus ", "+").replace(" minus ", "-")
-                 .replace(" times ", "*").replace(" divided by ", "/"))
+        return normalize_numbers(text)
 
     def get_hash(self, normalized_text: str) -> str:
         return hashlib.sha256((normalized_text or "").encode("utf-8")).hexdigest()

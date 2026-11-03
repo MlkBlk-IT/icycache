@@ -8,6 +8,8 @@ __pycache__/
 fix_*.py
 *.pre_purge*
 .pytest_cache/
+.pytest-tmp/
+.pytest-out.txt
 *.egg-info/
 build/
 dist/
